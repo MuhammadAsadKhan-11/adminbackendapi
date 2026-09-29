@@ -1,0 +1,19 @@
+# Render.com Blueprint — backend ek baar deploy karo, phir hamesha ka URL milta hai.
+services:
+  - type: web
+    name: electraguard-admin-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: REQUIRE_AUTH
+        value: "true"
+      - key: APP_TIMEZONE
+        value: Asia/Karachi
+      # Poori serviceAccountKey.json ek line mai (Render tumse deploy ke waqt value poochega)
+      - key: FIREBASE_CREDENTIALS_JSON
+        sync: false
