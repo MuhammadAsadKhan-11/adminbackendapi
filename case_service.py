@@ -988,8 +988,9 @@ def mark_my_notifications_read(uid: str, email: str, ids: List[str], mark_all: b
     if not targets:
         return 0
     now = datetime.now(timezone.utc)
-    batch = db.batch()
-    for sn in targets:
-        batch.update(sn.reference, {"read": True, "readAt": now})
-    batch.commit()
+    for i in range(0, len(targets), 400):  # Firestore batches hold max 500 writes
+        batch = db.batch()
+        for sn in targets[i : i + 400]:
+            batch.update(sn.reference, {"read": True, "readAt": now})
+        batch.commit()
     return len(targets)

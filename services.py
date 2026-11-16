@@ -1104,7 +1104,7 @@ def mark_notifications_read(uid: str, ids: List[str], mark_all: bool) -> None:
     if mark_all:
         # lastReadAll + abhi maujood sab ids (clock-skew wali "future" createdAt ke liye bhi safe)
         current = [n["id"] for n in _all_notifications()]
-        ref.set({"lastReadAll": datetime.now(timezone.utc), "readIds": current[-500:]}, merge=True)
+        ref.set({"lastReadAll": datetime.now(timezone.utc), "readIds": current[:500]}, merge=True)
         return
     if not ids:
         return
