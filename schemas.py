@@ -433,3 +433,24 @@ class AlertItem(BaseModel):
 class AlertsResponse(BaseModel):
     activeCount: int
     alerts: List[AlertItem]
+
+# ── Profile: two-factor authentication setting ───────────────
+class TwoFactorStatus(BaseModel):
+    enabled: bool
+    available: bool = True
+    maskedEmail: str = ""
+
+
+class TwoFactorChangeRequest(BaseModel):
+    enable: bool
+    resend: bool = False
+
+
+class TwoFactorConfirmRequest(BaseModel):
+    enable: bool
+    code: str
+    deviceId: str = ""
+
+
+class TwoFactorConfirmResponse(BaseModel):
+    enabled: bool

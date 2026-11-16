@@ -75,6 +75,10 @@ from schemas import (
     SendNotificationResponse,
     SentNotificationsResponse,
     SessionResponse,
+    TwoFactorChangeRequest,
+    TwoFactorConfirmRequest,
+    TwoFactorConfirmResponse,
+    TwoFactorStatus,
 )
 from reports_service import PERIODS, build_alerts, build_reports_csv, build_reports_summary
 from services import (
@@ -194,6 +198,23 @@ def auth_session(user: dict = Depends(require_signed_in)):
 def auth_logout(user: dict = Depends(require_signed_in)):
     auth_otp.logout(user)
     return {"ok": True}
+
+
+@app.get("/api/auth/2fa", response_model=TwoFactorStatus, tags=["auth"])
+def auth_2fa_status(user: dict = Depends(require_signed_in)):
+    """Profile screen: is two-factor authentication on for this account?"""
+    return auth_otp.two_factor_status(user)
+
+
+@app.post("/api/auth/2fa/request", response_model=OtpRequestResponse, tags=["auth"])
+def auth_2fa_request(body: TwoFactorChangeRequest, user: dict = Depends(require_signed_in)):
+    """Emails a code to confirm turning 2FA on or off."""
+    return auth_otp.request_two_factor_change(user, body.enable, body.resend)
+
+
+@app.post("/api/auth/2fa/confirm", response_model=TwoFactorConfirmResponse, tags=["auth"])
+def auth_2fa_confirm(body: TwoFactorConfirmRequest, user: dict = Depends(require_signed_in)):
+    return auth_otp.confirm_two_factor_change(user, body.enable, body.code, body.deviceId)
 
 
 @app.post("/api/auth/password-reset/request", response_model=ResetCodeResponse, tags=["auth"])

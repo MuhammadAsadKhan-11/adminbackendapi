@@ -241,7 +241,14 @@ def token_auth_time(decoded: dict) -> int:
         return 0
 
 
-def is_2fa_verified(uid: str, auth_time: int) -> bool:
+def two_factor_enabled(session: dict, admin: bool) -> bool:
+    """Per-account setting chosen in the Profile screen. Until the user changes it,
+    consumers start with 2FA OFF and admins with 2FA ON."""
+    v = (session or {}).get("twoFactorEnabled")
+    return v if isinstance(v, bool) else admin
+
+
+def is_2fa_verified(uid: str, auth_time: int, admin: bool = False) -> bool:
     key = (uid, auth_time)
     now = time.monotonic()
     ts = _mfa_cache.get(key)
@@ -250,7 +257,7 @@ def is_2fa_verified(uid: str, auth_time: int) -> bool:
     snap = get_db().collection(get_settings().auth_sessions_collection).document(uid).get()
     d = snap.to_dict() or {}
     verified = {int(x) for x in (d.get("verifiedAuthTimes") or []) if isinstance(x, (int, float))}
-    ok = bool(auth_time) and auth_time in verified
+    ok = (not two_factor_enabled(d, admin)) or (bool(auth_time) and auth_time in verified)
     if ok:
         _mfa_cache[key] = now
     return ok
@@ -262,10 +269,10 @@ def forget_2fa(uid: str, auth_time: Optional[int] = None) -> None:
             _mfa_cache.pop(key, None)
 
 
-def _enforce_2fa(decoded: dict) -> None:
+def _enforce_2fa(decoded: dict, admin: bool = False) -> None:
     if not get_settings().require_2fa:
         return
-    if not is_2fa_verified(decoded["uid"], token_auth_time(decoded)):
+    if not is_2fa_verified(decoded["uid"], token_auth_time(decoded), admin):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email verification (2FA) is required for this sign-in.",
@@ -281,7 +288,7 @@ def authenticate_token(token: str) -> dict:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
         )
-    _enforce_2fa(decoded)
+    _enforce_2fa(decoded, admin=True)
     return decoded
 
 

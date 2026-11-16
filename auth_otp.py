@@ -27,7 +27,7 @@ from fastapi import HTTPException, Request
 from firebase_admin import auth as fb_auth
 from firebase_admin import firestore as fb_firestore
 
-from core import forget_2fa, get_db, get_settings, is_admin, local_tz, token_auth_time
+from core import forget_2fa, get_db, get_settings, is_admin, local_tz, token_auth_time, two_factor_enabled
 
 try:
     import requests
@@ -37,6 +37,12 @@ except ImportError:  # pragma: no cover
 log = logging.getLogger("electraguard.auth")
 
 EMAILJS_SEND_URL = "https://api.emailjs.com/api/v1.0/email/send"
+PURPOSE_LABELS = {
+    "login": "Sign-in verification",
+    "password_reset": "Password reset",
+    "2fa_on": "Turn on two-factor authentication",
+    "2fa_off": "Turn off two-factor authentication",
+}
 _MAX_REMEMBERED_SIGNINS = 10
 
 
@@ -131,7 +137,7 @@ def send_otp_email(to_email: str, code: str, *, admin: bool, purpose: str) -> No
             "to_email": to_email,
             "otp_code": code,
             "expiry_minutes": str(max(1, s.otp_ttl_seconds // 60)),
-            "purpose": "Password reset" if purpose == "password_reset" else "Sign-in verification",
+            "purpose": PURPOSE_LABELS.get(purpose, "Sign-in verification"),
             "portal": "Admin" if admin else "Consumer",
             # aliases used by EmailJS's built-in "One-Time Password" template
             "email": to_email,
@@ -418,6 +424,9 @@ def request_login_otp(decoded: Dict[str, Any], role: str, device_id: str, resend
 
     snap = _sessions().document(uid).get()
     d = snap.to_dict() or {} if snap.exists else {}
+    if not two_factor_enabled(d, role == "admin"):
+        # 2FA is off for this account (Profile → Two-Factor Authentication).
+        return {"required": False, "trustedDevice": False, "maskedEmail": mask_email(email)}
     if auth_time in {int(x) for x in (d.get("verifiedAuthTimes") or []) if isinstance(x, (int, float))}:
         return {"required": False, "trustedDevice": False, "maskedEmail": mask_email(email)}
 
@@ -459,10 +468,11 @@ def session_status(decoded: Dict[str, Any]) -> Dict[str, Any]:
     verified = auth_time in {int(x) for x in (d.get("verifiedAuthTimes") or []) if isinstance(x, (int, float))}
     admin = is_admin(uid)
     role = "admin" if admin else ("consumer" if _consumer_doc_for_uid(uid) is not None else None)
+    enabled = get_settings().require_2fa and two_factor_enabled(d, admin)
     return {
-        "verified": bool(verified) or not get_settings().require_2fa,
+        "verified": bool(verified) or not enabled,
         "role": role,
-        "twoFactorRequired": get_settings().require_2fa,
+        "twoFactorRequired": enabled,
     }
 
 
@@ -531,3 +541,82 @@ def verify_reset_code(identifier: str, code: str) -> Dict[str, Any]:
     uid, email, admin = _resolve_account(identifier)
     _check_challenge(f"reset:{uid}", code)
     return {"verified": True, "email": email, "portal": "admin" if admin else "consumer"}
+
+
+# ─────────────────────────────────────────────────────────────
+# PROFILE: turn two-factor authentication on / off
+# Both directions need a code emailed to the account, so a stolen session
+# cannot switch 2FA off, and nobody can lock themselves out with a bad email.
+# ─────────────────────────────────────────────────────────────
+def _session_doc(uid: str) -> Dict[str, Any]:
+    snap = _sessions().document(uid).get()
+    return (snap.to_dict() or {}) if snap.exists else {}
+
+
+def _require_current_signin_ok(decoded: Dict[str, Any], d: Dict[str, Any], admin: bool) -> None:
+    """If 2FA is on, this sign-in must already have passed it."""
+    auth_time = token_auth_time(decoded)
+    verified = {int(x) for x in (d.get("verifiedAuthTimes") or []) if isinstance(x, (int, float))}
+    if two_factor_enabled(d, admin) and auth_time not in verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Email verification (2FA) is required for this sign-in.",
+            headers={"X-Auth-Error": "2fa_required"},
+        )
+
+
+def two_factor_status(decoded: Dict[str, Any]) -> Dict[str, Any]:
+    uid = decoded["uid"]
+    admin = is_admin(uid)
+    d = _session_doc(uid)
+    return {
+        "enabled": two_factor_enabled(d, admin),
+        "available": get_settings().require_2fa,
+        "maskedEmail": mask_email(_auth_email(decoded)),
+    }
+
+
+def request_two_factor_change(decoded: Dict[str, Any], enable: bool, resend: bool) -> Dict[str, Any]:
+    if not get_settings().require_2fa:
+        raise HTTPException(status_code=400, detail="Two-factor authentication is turned off on the server.")
+    uid = decoded["uid"]
+    admin = is_admin(uid)
+    if not admin and _consumer_doc_for_uid(uid) is None:
+        raise HTTPException(status_code=403, detail="Account not found.")
+    d = _session_doc(uid)
+    _require_current_signin_ok(decoded, d, admin)
+    if two_factor_enabled(d, admin) == bool(enable):
+        raise HTTPException(status_code=400, detail=f"Two-factor authentication is already {'on' if enable else 'off'}.")
+    email = _auth_email(decoded)
+    if not email:
+        raise HTTPException(status_code=400, detail="This account has no email address for verification.")
+    target = "on" if enable else "off"
+    return _issue_challenge(
+        f"2fa_{target}:{uid}",
+        uid=uid,
+        email=email,
+        admin=admin,
+        purpose=f"2fa_{target}",
+        auth_time=token_auth_time(decoded),
+        resend=resend,
+    )
+
+
+def confirm_two_factor_change(decoded: Dict[str, Any], enable: bool, code: str, device_id: str) -> Dict[str, Any]:
+    uid = decoded["uid"]
+    admin = is_admin(uid)
+    auth_time = token_auth_time(decoded)
+    target = "on" if enable else "off"
+    _check_challenge(f"2fa_{target}:{uid}", code, auth_time=auth_time)
+    role = "admin" if admin else "consumer"
+    now = _now()
+    _sessions().document(uid).set(
+        {"uid": uid, "role": role, "twoFactorEnabled": bool(enable), "twoFactorChangedAt": now, "updatedAt": now},
+        merge=True,
+    )
+    if enable:
+        # this sign-in just proved the email, so it stays signed in
+        _mark_signin_verified(uid, auth_time, role, device_id, trust_device=bool(device_id))
+    forget_2fa(uid)
+    log.info("2FA turned %s for a %s account", target, role)
+    return {"enabled": bool(enable)}
