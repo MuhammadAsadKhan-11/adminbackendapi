@@ -6,3 +6,4 @@ pydantic-settings>=2.2
 tzdata>=2024.1
 python-multipart>=0.0.9
 requests>=2.31
+boto3>=1.34

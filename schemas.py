@@ -159,11 +159,19 @@ class TimelineEntry(BaseModel):
 
 
 class EvidenceItem(BaseModel):
+    id: str = ""
     name: str
     type: str                        # image | document
-    url: str
+    url: str = ""                    # legacy only; S3 files use /evidence/{id}/url
+    category: str = ""               # image | document | spreadsheet
+    fileName: str = ""
+    fileType: str = ""               # MIME type
+    extension: str = ""
+    size: int = 0                    # bytes
+    uploadedAt: Optional[str] = None
     uploadedBy: Optional[str] = None
     date: Optional[str] = None
+    downloadable: bool = True
 
 
 class CaseDetail(CaseSummary):
@@ -171,6 +179,7 @@ class CaseDetail(CaseSummary):
     meterNumber: Optional[str] = None
     timeline: List[TimelineEntry] = []
     evidence: List[EvidenceItem] = []
+    notified: bool = False
 
 
 class AssignInspectorRequest(BaseModel):
@@ -189,22 +198,178 @@ class InspectorsResponse(BaseModel):
 
 
 # ── Consumer-facing notifications ("me" endpoints) ───────────
+class NotificationEvidence(BaseModel):
+    id: str
+    name: str
+    category: str = ""
+    fileType: str = ""
+    size: int = 0
+
+
 class MyNotificationItem(BaseModel):
     id: str
     type: str
     title: str
     message: str
-    caseId: Optional[str] = None
+    caseId: Optional[str] = None      # human case number, e.g. CASE123456
+    caseDocId: Optional[str] = None   # Firestore id used by the case endpoints
+    caseTitle: Optional[str] = None
+    caseStatus: Optional[str] = None
+    evidence: List[NotificationEvidence] = []
+    consumerId: str = ""
     read: bool
+    readAt: Optional[str] = None
     createdAt: Optional[str] = None
 
 
 class MyNotificationsResponse(BaseModel):
     items: List[MyNotificationItem]
+    unreadCount: int = 0
 
 
 class MarkMyReadRequest(BaseModel):
     ids: List[str] = []
+    markAll: bool = False
+
+
+class MyCaseEvidence(BaseModel):
+    id: str
+    name: str
+    fileName: str = ""
+    type: str
+    category: str = ""
+    fileType: str = ""
+    extension: str = ""
+    size: int = 0
+    uploadedAt: Optional[str] = None
+    uploadedBy: Optional[str] = None
+    date: Optional[str] = None
+    downloadable: bool = True
+
+
+class MyCaseRemark(BaseModel):
+    message: str
+    at: Optional[str] = None
+
+
+class MyCase(BaseModel):
+    id: str
+    caseNumber: str
+    title: str
+    category: str = ""
+    description: str = ""
+    status: str
+    priority: str = ""
+    area: str = ""
+    inspectorAssigned: bool = False
+    inspector: Optional[str] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    timeline: List[TimelineEntry] = []
+    remarks: List[MyCaseRemark] = []
+    evidence: List[MyCaseEvidence] = []
+
+
+class MyCasesResponse(BaseModel):
+    items: List[MyCase]
+
+
+class DownloadUrlResponse(BaseModel):
+    url: str
+    expiresIn: int                    # seconds; 0 = legacy permanent URL
+    fileName: str
+    contentType: str
+
+
+class CaseStatusRequest(BaseModel):
+    status: str
+    note: str = ""
+
+
+class CaseRemarkRequest(BaseModel):
+    message: str
+    notifyConsumer: bool = True
+
+
+class SendNotificationRequest(BaseModel):
+    consumerId: str
+    title: str
+    message: str
+    caseId: Optional[str] = None
+
+
+class SendNotificationResponse(BaseModel):
+    ok: bool
+    id: Optional[str] = None
+
+
+class SentNotificationsResponse(BaseModel):
+    items: List[MyNotificationItem]
+
+
+# ── Auth / email OTP ─────────────────────────────────────────
+class ResolveLoginRequest(BaseModel):
+    identifier: str
+
+
+class ResolveLoginResponse(BaseModel):
+    email: str
+
+
+class OtpRequest(BaseModel):
+    role: str                          # admin | consumer
+    deviceId: str = ""
+    resend: bool = False
+
+
+class OtpRequestResponse(BaseModel):
+    required: bool
+    trustedDevice: bool = False
+    alreadySent: bool = False
+    maskedEmail: str = ""
+    expiresIn: int = 0
+    resendIn: int = 0
+
+
+class OtpVerifyRequest(BaseModel):
+    code: str
+    deviceId: str = ""
+
+
+class OtpVerifyResponse(BaseModel):
+    verified: bool
+    role: str
+
+
+class SessionResponse(BaseModel):
+    verified: bool
+    role: Optional[str] = None
+    twoFactorRequired: bool = True
+
+
+class ResetCodeRequest(BaseModel):
+    identifier: str
+    resend: bool = False
+
+
+class ResetCodeResponse(BaseModel):
+    required: bool = True
+    alreadySent: bool = False
+    maskedEmail: str = ""
+    expiresIn: int = 0
+    resendIn: int = 0
+    portal: str = "consumer"
+
+
+class ResetVerifyRequest(BaseModel):
+    identifier: str
+    code: str
+
+
+class ResetVerifyResponse(BaseModel):
+    verified: bool
+    email: str
+    portal: str
 
 
 # ── Reports & Analytics ──────────────────────────────────────

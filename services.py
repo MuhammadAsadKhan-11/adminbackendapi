@@ -51,13 +51,14 @@ RESOLVED_WORDS = ("resolved", "closed", "complete", "done", "dismiss", "reject",
 CASE_FIELDS = [
     "caseId", "caseNumber", "caseNo", "case_number",
     "consumerId", "consumerUid", "consumer_id", "uid", "userId", "consumerEmail", "email",
-    "description", "title", "issueType", "issueValue", "location",
-    "consumerName", "riskLevel", "assignedInspector",
+    "issueType", "issueValue", "category", "description", "title", "location", "area",
+    "consumerName", "riskLevel", "assignedInspector", "consumerDocId",
     "currentStatus", "status", "escalated", "resolution",
     "createdAt", "created_at", "resolvedAt", "closedAt", "resolved_at",
     "updatedAt", "updated_at", "lastUpdated", "statusUpdatedAt",
     # Case Management screens (Create/Escalate) ke naye fields:
     "priority", "meterNumber", "evidence", "timeline", "createdBy",
+    "hasImage",
 ]
 BLANK_IDS = {"", "—", "-", "none", "null"}
 
@@ -433,7 +434,7 @@ def _cases() -> List[Dict[str, Any]]:
         for snap in query.stream():
             d = snap.to_dict() or {}
             status_raw = str(first(d, "currentStatus", "status", default="Open")).strip() or "Open"
-            issue_type = str(first(d, "issueType", default="")).strip()
+            issue_type = str(first(d, "issueType", "category", default="")).strip()
             issue_value = str(first(d, "issueValue", default="")).strip()
             out.append(
                 {
@@ -458,8 +459,8 @@ def _cases() -> List[Dict[str, Any]]:
                     "text": str(first(d, "description", "title", default="")).strip(),
                     "escalated": _truthy(d.get("escalated")),
                     "riskLevel": str(first(d, "riskLevel", default="")).strip(),
-                    "location": str(first(d, "location", default="")).strip(),
-                    "status": status_raw.title(),
+                    "location": str(first(d, "location", "area", default="")).strip(),
+                    "status": _normalize_case_status(status_raw),
                     "resolved": any(w in status_raw.lower() for w in RESOLVED_WORDS),
                     "createdAt": to_dt(first(d, "createdAt", "created_at")),
                     "resolvedAt": to_dt(first(d, "resolvedAt", "closedAt", "resolved_at")),
@@ -467,7 +468,7 @@ def _cases() -> List[Dict[str, Any]]:
                     # Case Management (naye fields):
                     "priority": str(first(d, "priority", default="")).strip(),
                     "assignedInspector": str(first(d, "assignedInspector", default="")).strip(),
-                    "evidenceCount": len(d.get("evidence") or []),
+                    "evidenceCount": len(d.get("evidence") or []) + (1 if d.get("hasImage") else 0),
                 }
             )
         return out
@@ -1122,479 +1123,33 @@ def mark_notifications_read(uid: str, ids: List[str], mark_all: bool) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 CASE_STATUSES = ("Open", "In Progress", "Closed", "Rejected")
+# Consumer reports store "Under Investigation"; the admin screens use the four statuses above.
+_STATUS_ALIASES = {
+    "under investigation": "In Progress",
+    "investigating": "In Progress",
+    "in progress": "In Progress",
+    "escalated": "In Progress",
+    "open": "Open",
+    "pending": "Open",
+    "new": "Open",
+    "resolved": "Closed",
+    "closed": "Closed",
+    "complete": "Closed",
+    "completed": "Closed",
+    "rejected": "Rejected",
+    "false alarm": "Rejected",
+}
 
 
-def _find_consumer_doc(consumer_id: str) -> Optional[Dict[str, Any]]:
-    """consumerId (jaise 'CON001') ya seedha Firestore doc-id se consumer doc dhoondta hai.
-    Return: {"docId": ..., "data": {...raw firestore fields...}}"""
-    s = get_settings()
-    col = get_db().collection(s.consumers_collection)
-
-    rows = list(col.where("consumerId", "==", consumer_id).limit(1).stream())
-    if not rows:
-        snap = col.document(consumer_id).get()
-        rows = [snap] if snap.exists else []
-
-    if not rows:
-        return None
-    snap = rows[0]
-    return {"docId": snap.id, "data": snap.to_dict() or {}}
+def _normalize_case_status(raw: str) -> str:
+    key = (raw or "").strip().lower()
+    if key in _STATUS_ALIASES:
+        return _STATUS_ALIASES[key]
+    titled = (raw or "").strip().title()
+    if titled in CASE_STATUSES:
+        return titled
+    return "Open"
 
 
-def _send_expo_push(push_token: str, title: str, body: str, data: Optional[Dict[str, Any]] = None) -> None:
-    """Consumer ke Expo push token par notification bhejta hai (best-effort, kabhi raise nahi karta)."""
-    if not get_settings().send_push_notifications:
-        return
-    if not push_token or not str(push_token).startswith("ExponentPushToken"):
-        return
-    if requests is None:
-        log.warning("`requests` package installed nahi hai — push notification skip")
-        return
-    try:
-        requests.post(
-            "https://exp.host/--/api/v2/push/send",
-            json={
-                "to": push_token,
-                "title": title,
-                "body": body,
-                "data": data or {},
-                "sound": "default",
-            },
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            timeout=8,
-        )
-    except Exception as exc:  # push fail ho to case action fail nahi honi chahiye
-        log.warning("Expo push failed: %s", exc)
 
-
-def _notify_consumer(consumer_doc_id: Optional[str], consumer_data: Dict[str, Any], title: str, body: str, case_id: str, ntype: str) -> None:
-    """Consumer ke apne 'notifications/{consumerDocId}' sub-collection mai entry
-    banata hai (NotificationsScreen isi se list dikhati hai) + push bhi bhejta hai."""
-    if not consumer_doc_id:
-        return
-    try:
-        get_db().collection("notifications").document(consumer_doc_id).collection("items").add(
-            {
-                "type": ntype,
-                "title": title,
-                "message": body,
-                "caseId": case_id,
-                "read": False,
-                "createdAt": datetime.now(timezone.utc),
-            }
-        )
-    except Exception as exc:
-        log.warning("Consumer notification write failed: %s", exc)
-
-    push_token = str(consumer_data.get("pushToken") or "").strip()
-    if push_token:
-        _send_expo_push(push_token, title, body, {"caseId": case_id, "type": ntype})
-
-
-def _evidence_from_upload(case_doc_id: str, filename: str, content: bytes, content_type: str, uploaded_by: str) -> Dict[str, Any]:
-    """Ek file Firebase Storage par upload karta hai aur EvidenceItem dict return karta hai."""
-    is_image = (content_type or "").startswith("image/")
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename or "file")
-    blob_path = f"case_evidence/{case_doc_id}/{uuid.uuid4().hex[:8]}_{safe_name}"
-
-    bucket = get_bucket()
-    blob = bucket.blob(blob_path)
-    blob.upload_from_string(content, content_type=content_type or "application/octet-stream")
-    blob.make_public()  # simple public URL — bucket ki default privacy rules is se override nahi hoti
-
-    return {
-        "name": filename or safe_name,
-        "type": "image" if is_image else "document",
-        "url": blob.public_url,
-        "uploadedBy": uploaded_by or "Admin",
-        "date": fmt_date(today_local()),
-    }
-
-
-def _case_doc_to_summary(doc_id: str, d: Dict[str, Any]) -> Dict[str, Any]:
-    status_raw = str(first(d, "currentStatus", "status", default="Open")).strip().title() or "Open"
-    if status_raw not in CASE_STATUSES:
-        status_raw = "Open"
-    created = to_dt(first(d, "createdAt", "created_at"))
-    return {
-        "id": doc_id,
-        "caseNumber": str(first(d, "caseId", "caseNumber", default=doc_id)),
-        "consumerId": str(first(d, "consumerId", default="")).strip(),
-        "consumerName": str(first(d, "consumerName", default="")).strip(),
-        "area": str(first(d, "location", default="")).strip(),
-        "status": status_raw,
-        "riskLevel": str(first(d, "riskLevel", default="Low")).strip() or "Low",
-        "category": str(first(d, "issueType", default="")).strip(),
-        "description": str(first(d, "description", "title", default="")).strip(),
-        "inspector": (str(d.get("assignedInspector")).strip() or None) if d.get("assignedInspector") else None,
-        "createdAt": fmt_date(to_local_day(created)) if created else "—",
-        "evidences": len(d.get("evidence") or []),
-    }
-
-
-def _case_doc_to_detail(doc_id: str, d: Dict[str, Any]) -> Dict[str, Any]:
-    summary = _case_doc_to_summary(doc_id, d)
-    timeline = [
-        {
-            "action": str(t.get("action", "")),
-            "date": str(t.get("date", "")),
-            "time": str(t.get("time", "")),
-        }
-        for t in (d.get("timeline") or [])
-    ]
-    evidence = [
-        {
-            "name": str(ev.get("name", "")),
-            "type": str(ev.get("type", "document")),
-            "url": str(ev.get("url", "")),
-            "uploadedBy": ev.get("uploadedBy"),
-            "date": ev.get("date"),
-        }
-        for ev in (d.get("evidence") or [])
-    ]
-    summary.update(
-        {
-            "priority": str(first(d, "priority", default="Normal")).strip() or "Normal",
-            "meterNumber": str(first(d, "meterNumber", default="") or summary["consumerId"]) or None,
-            "timeline": timeline,
-            "evidence": evidence,
-        }
-    )
-    return summary
-
-
-def list_cases(status: Optional[str] = None, search: Optional[str] = None) -> Dict[str, Any]:
-    rows = _cases()
-
-    counts = {st: 0 for st in CASE_STATUSES}
-    for c in rows:
-        counts[c["status"]] = counts.get(c["status"], 0) + 1
-
-    items = list(rows)
-    if status and status.strip():
-        items = [c for c in items if c["status"] == status.strip()]
-    if search and search.strip():
-        q = search.strip().lower()
-        items = [
-            c
-            for c in items
-            if q in " ".join([c["consumerName"], c["consumerId"], c["caseNumber"], c["location"]]).lower()
-        ]
-
-    floor = datetime.min.replace(tzinfo=timezone.utc)
-    items.sort(key=lambda c: c["createdAt"] or floor, reverse=True)
-
-    def to_summary(c: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "id": c["id"],
-            "caseNumber": c["caseNumber"],
-            "consumerId": c["consumerId"],
-            "consumerName": c["consumerName"],
-            "area": c["location"],
-            "status": c["status"],
-            "riskLevel": c["riskLevel"] or "Low",
-            "category": c["issueType"],
-            "description": c["fullDescription"] or c["description"],
-            "inspector": c["assignedInspector"] or None,
-            "createdAt": fmt_date(to_local_day(c["createdAt"])) if c["createdAt"] else "—",
-            "evidences": c["evidenceCount"],
-        }
-
-    return {
-        "total": len(rows),
-        "counts": counts,
-        "items": [to_summary(c) for c in items],
-    }
-
-
-def get_case_detail(case_id: str) -> Optional[Dict[str, Any]]:
-    s = get_settings()
-    col = get_db().collection(s.cases_collection)
-
-    snap = col.document(case_id).get()
-    if not snap.exists:
-        # fallback: caseId field se dhoondo (jaise "CASE000123")
-        rows = list(col.where("caseId", "==", case_id).limit(1).stream())
-        if not rows:
-            return None
-        snap = rows[0]
-
-    return _case_doc_to_detail(snap.id, snap.to_dict() or {})
-
-
-def create_case(
-    *,
-    consumer_id: str,
-    consumer_name: str,
-    area: str,
-    risk_level: str,
-    category: str,
-    description: str,
-    inspector: Optional[str],
-    priority: str,
-    files: List[Tuple[str, bytes, str]],  # (filename, content, content_type)
-    admin_uid: str,
-) -> Dict[str, Any]:
-    db = get_db()
-    settings = get_settings()
-
-    consumer = _find_consumer_doc(consumer_id)
-    consumer_email = ""
-    if consumer:
-        consumer_email = str(first(consumer["data"], "email", default="")).strip()
-        consumer_name = consumer_name or str(first(consumer["data"], "fullName", "name", default=""))
-
-    doc_ref = db.collection(settings.cases_collection).document()
-    case_number = f"CASE{int(datetime.now(timezone.utc).timestamp() * 1000) % 1000000:06d}"
-
-    evidence = [
-        _evidence_from_upload(doc_ref.id, name, content, ctype, "Admin")
-        for (name, content, ctype) in files
-    ]
-
-    now = datetime.now(timezone.utc)
-    now_local = now.astimezone(local_tz())
-    status_val = "In Progress" if inspector else "Open"
-
-    data = {
-        "caseId": case_number,
-        "consumerId": consumer_id,
-        "consumerEmail": consumer_email,
-        "consumerName": consumer_name,
-        "description": description,
-        "issueType": category,
-        "issueValue": category,
-        "location": area,
-        "riskLevel": risk_level,
-        "priority": priority,
-        "assignedInspector": inspector or "",
-        "currentStatus": status_val,
-        "escalated": False,
-        "resolution": "",
-        "meterNumber": consumer_id,
-        "evidence": evidence,
-        "timeline": [
-            {
-                "action": f"Case created — {category}",
-                "date": now_local.date().isoformat(),
-                "time": now_local.strftime("%H:%M"),
-            }
-        ],
-        "createdAt": now,
-        "updatedAt": now,
-        "createdBy": admin_uid,
-    }
-    doc_ref.set(data)
-    cache.invalidate()
-
-    if consumer:
-        _notify_consumer(
-            consumer["docId"],
-            consumer["data"],
-            "⚠️ Case Filed Against Your Account",
-            f"A new case ({case_number}) has been filed regarding: {category}. Our team will investigate shortly.",
-            case_number,
-            "case_filed",
-        )
-
-    return _case_doc_to_detail(doc_ref.id, data)
-
-
-def assign_inspector(case_id: str, inspector: str, admin_uid: str) -> Optional[Dict[str, Any]]:
-    s = get_settings()
-    ref = get_db().collection(s.cases_collection).document(case_id)
-    snap = ref.get()
-    if not snap.exists:
-        return None
-
-    now = datetime.now(timezone.utc)
-    now_local = now.astimezone(local_tz())
-    d = snap.to_dict() or {}
-    current_status = str(first(d, "currentStatus", "status", default="Open")).strip().title()
-    new_status = "In Progress" if current_status == "Open" else current_status
-
-    ref.update(
-        {
-            "assignedInspector": inspector,
-            "currentStatus": new_status,
-            "updatedAt": now,
-            "timeline": (d.get("timeline") or [])
-            + [{"action": f"Case assigned to {inspector}", "date": now_local.date().isoformat(), "time": now_local.strftime("%H:%M")}],
-        }
-    )
-    cache.invalidate()
-    return get_case_detail(case_id)
-
-
-def close_case(case_id: str, admin_uid: str) -> Optional[Dict[str, Any]]:
-    s = get_settings()
-    ref = get_db().collection(s.cases_collection).document(case_id)
-    snap = ref.get()
-    if not snap.exists:
-        return None
-
-    d = snap.to_dict() or {}
-    now = datetime.now(timezone.utc)
-    now_local = now.astimezone(local_tz())
-    ref.update(
-        {
-            "currentStatus": "Closed",
-            "resolvedAt": now,
-            "updatedAt": now,
-            "timeline": (d.get("timeline") or [])
-            + [{"action": "Case closed", "date": now_local.date().isoformat(), "time": now_local.strftime("%H:%M")}],
-        }
-    )
-    cache.invalidate()
-
-    consumer = _find_consumer_doc(str(first(d, "consumerId", default="")))
-    if consumer:
-        case_number = str(first(d, "caseId", "caseNumber", default=case_id))
-        _notify_consumer(
-            consumer["docId"],
-            consumer["data"],
-            "✅ Case Closed",
-            f"Your case ({case_number}) has been closed.",
-            case_number,
-            "case_closed",
-        )
-
-    return get_case_detail(case_id)
-
-
-def escalate_case(
-    case_id: str,
-    *,
-    escalation_level: str,
-    reason: str,
-    description: str,
-    files: List[Tuple[str, bytes, str]],
-    admin_uid: str,
-) -> Optional[Dict[str, Any]]:
-    s = get_settings()
-    ref = get_db().collection(s.cases_collection).document(case_id)
-    snap = ref.get()
-    if not snap.exists:
-        return None
-
-    d = snap.to_dict() or {}
-    now = datetime.now(timezone.utc)
-    now_local = now.astimezone(local_tz())
-
-    new_evidence = [_evidence_from_upload(case_id, name, content, ctype, "Admin") for (name, content, ctype) in files]
-
-    ref.update(
-        {
-            "escalated": True,
-            "riskLevel": "Critical",
-            "priority": "Urgent",
-            "resolution": f"Escalated to {escalation_level}: {reason} — {description}",
-            "evidence": (d.get("evidence") or []) + new_evidence,
-            "updatedAt": now,
-            "timeline": (d.get("timeline") or [])
-            + [
-                {
-                    "action": f"Case escalated to {escalation_level} — {reason}",
-                    "date": now_local.date().isoformat(),
-                    "time": now_local.strftime("%H:%M"),
-                }
-            ],
-        }
-    )
-    cache.invalidate()
-
-    consumer = _find_consumer_doc(str(first(d, "consumerId", default="")))
-    if consumer:
-        case_number = str(first(d, "caseId", "caseNumber", default=case_id))
-        _notify_consumer(
-            consumer["docId"],
-            consumer["data"],
-            "⬆ Case Escalated",
-            f"Your case ({case_number}) has been escalated to {escalation_level} for further review.",
-            case_number,
-            "case_escalated",
-        )
-
-    return get_case_detail(case_id)
-
-
-def list_inspectors() -> List[Dict[str, Any]]:
-    s = get_settings()
-    rows = list(get_db().collection(s.inspectors_collection).stream())
-    if rows:
-        return [
-            {
-                "id": snap.id,
-                "name": str(first(d, "name", default=snap.id)),
-                "area": str(first(d, "area", default="")),
-                "available": bool(d.get("available", True)),
-            }
-            for snap in rows
-            for d in [snap.to_dict() or {}]
-        ]
-
-    # Fallback: cases mai jo inspector names pehle se use ho rahe hain
-    names = sorted({c["assignedInspector"] for c in _cases() if c["assignedInspector"]})
-    return [{"id": f"insp:{n}", "name": n, "area": "", "available": True} for n in names]
-
-
-# ─────────────────────────────────────────────────────────────
-# CONSUMER-FACING NOTIFICATIONS  ("me" endpoints — apna consumer app)
-# ─────────────────────────────────────────────────────────────
-def _resolve_consumer_doc_id(uid: str, email: str) -> Optional[str]:
-    """Firebase Auth uid consumers collection ke doc-id ke barabar hota hai
-    (frontend signup isi tarah karta hai) — pehle wahi try karo, warna email se."""
-    s = get_settings()
-    col = get_db().collection(s.consumers_collection)
-    snap = col.document(uid).get()
-    if snap.exists:
-        return snap.id
-    if email:
-        rows = list(col.where("email", "==", email).limit(1).stream())
-        if rows:
-            return rows[0].id
-    return None
-
-
-def get_my_notifications(uid: str, email: str, limit: int = 50) -> List[Dict[str, Any]]:
-    doc_id = _resolve_consumer_doc_id(uid, email)
-    if not doc_id:
-        return []
-
-    items = (
-        get_db()
-        .collection("notifications")
-        .document(doc_id)
-        .collection("items")
-        .order_by("createdAt", direction=_fb_firestore.Query.DESCENDING)
-        .limit(limit)
-        .stream()
-    )
-    out = []
-    for snap in items:
-        d = snap.to_dict() or {}
-        created = to_dt(d.get("createdAt"))
-        out.append(
-            {
-                "id": snap.id,
-                "type": str(d.get("type", "alert")),
-                "title": str(d.get("title", "")),
-                "message": str(d.get("message", "")),
-                "caseId": d.get("caseId"),
-                "read": bool(d.get("read", False)),
-                "createdAt": created.astimezone(timezone.utc).isoformat() if created else None,
-            }
-        )
-    return out
-
-
-def mark_my_notifications_read(uid: str, email: str, ids: List[str]) -> None:
-    doc_id = _resolve_consumer_doc_id(uid, email)
-    if not doc_id or not ids:
-        return
-    col = get_db().collection("notifications").document(doc_id).collection("items")
-    for nid in ids:
-        try:
-            col.document(nid).update({"read": True})
-        except Exception:
-            continue
+# Case management, evidence and consumer notifications live in case_service.py

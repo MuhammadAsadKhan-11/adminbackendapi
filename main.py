@@ -28,41 +28,62 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from google.api_core.exceptions import GoogleAPICallError
 
-from core import authenticate_token, get_db, get_settings, init_firebase, require_admin, require_consumer
+import auth_otp
+import case_service as cases
+import evidence_storage
+from core import (
+    authenticate_token,
+    get_db,
+    get_settings,
+    init_firebase,
+    require_admin,
+    require_consumer,
+    require_signed_in,
+)
 from realtime import live
 from schemas import (
     AlertsResponse,
     AssignInspectorRequest,
+    CaseRemarkRequest,
+    CaseStatusRequest,
     CasesListResponse,
     CaseDetail,
     ConsumerProfile,
     DashboardResponse,
+    DownloadUrlResponse,
     InspectorsResponse,
     MarkMyReadRequest,
     MarkReadRequest,
+    MyCase,
+    MyCasesResponse,
     MyNotificationsResponse,
     NotificationsResponse,
     OkResponse,
+    OtpRequest,
+    OtpRequestResponse,
+    OtpVerifyRequest,
+    OtpVerifyResponse,
     ReportsSummaryResponse,
+    ResetCodeRequest,
+    ResetCodeResponse,
+    ResetVerifyRequest,
+    ResetVerifyResponse,
+    ResolveLoginRequest,
+    ResolveLoginResponse,
     RiskListResponse,
+    SendNotificationRequest,
+    SendNotificationResponse,
+    SentNotificationsResponse,
+    SessionResponse,
 )
 from reports_service import PERIODS, build_alerts, build_reports_csv, build_reports_summary
 from services import (
-    assign_inspector,
     build_dashboard,
     build_profile,
     build_risk_list,
-    close_case,
-    create_case,
     debug_cases,
     debug_uploads,
-    escalate_case,
-    get_case_detail,
-    get_my_notifications,
     get_notifications,
-    list_cases,
-    list_inspectors,
-    mark_my_notifications_read,
     mark_notifications_read,
 )
 
@@ -75,6 +96,8 @@ ALLOWED_LEVELS = {"all", "high", "medium", "low"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_firebase()
+    if not get_settings().require_auth:
+        log.warning("REQUIRE_AUTH=false: API authentication is DISABLED. Use only for local testing.")
     await asyncio.to_thread(live.start, asyncio.get_running_loop())
     yield
     live.stop()
@@ -94,6 +117,7 @@ app.add_middleware(
     allow_credentials=False,  # Bearer token header use hota hai, cookies nahi
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Auth-Error", "Retry-After"],  # web build reads these
 )
 
 
@@ -123,7 +147,65 @@ def health_db():
         list(get_db().collection(get_settings().consumers_collection).limit(1).stream())
         return {"status": "ok", "firestore": "connected"}
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Firestore not reachable: {exc}")
+        log.error("Firestore health check failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Firestore not reachable")
+
+
+@app.get("/health/config", tags=["meta"])
+def health_config():
+    """Which integrations are configured (true/false only, never values)."""
+    s = get_settings()
+    return {
+        "s3": {"bucket": evidence_storage.s3_configured(), "region": bool(s.s3_region)},
+        "emailjs": auth_otp.emailjs_config_status(),
+        "require2fa": s.require_2fa,
+        "requireAuth": s.require_auth,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# AUTH  (email OTP 2FA + password-reset codes)
+# ─────────────────────────────────────────────────────────────
+@app.post("/api/auth/resolve-login", response_model=ResolveLoginResponse, tags=["auth"])
+def auth_resolve_login(body: ResolveLoginRequest, request: Request):
+    """Consumer ID -> sign-in email, so the app no longer needs public read access to consumers."""
+    auth_otp.rate_limit_ip(request, "resolve", limit=30)
+    return {"email": auth_otp.resolve_login_email(body.identifier)}
+
+
+@app.post("/api/auth/otp/request", response_model=OtpRequestResponse, tags=["auth"])
+def auth_otp_request(body: OtpRequest, user: dict = Depends(require_signed_in)):
+    """After the password sign-in: emails a 6-digit code (or skips it for a trusted device)."""
+    return auth_otp.request_login_otp(user, body.role, body.deviceId, body.resend)
+
+
+@app.post("/api/auth/otp/verify", response_model=OtpVerifyResponse, tags=["auth"])
+def auth_otp_verify(body: OtpVerifyRequest, user: dict = Depends(require_signed_in)):
+    return auth_otp.verify_login_otp(user, body.code, body.deviceId)
+
+
+@app.get("/api/auth/session", response_model=SessionResponse, tags=["auth"])
+def auth_session(user: dict = Depends(require_signed_in)):
+    """Is the current Firebase sign-in fully verified? (used on app start)."""
+    return auth_otp.session_status(user)
+
+
+@app.post("/api/auth/logout", response_model=OkResponse, tags=["auth"])
+def auth_logout(user: dict = Depends(require_signed_in)):
+    auth_otp.logout(user)
+    return {"ok": True}
+
+
+@app.post("/api/auth/password-reset/request", response_model=ResetCodeResponse, tags=["auth"])
+def auth_reset_request(body: ResetCodeRequest, request: Request):
+    auth_otp.rate_limit_ip(request, "reset", limit=10)
+    return auth_otp.request_reset_code(body.identifier, body.resend)
+
+
+@app.post("/api/auth/password-reset/verify", response_model=ResetVerifyResponse, tags=["auth"])
+def auth_reset_verify(body: ResetVerifyRequest, request: Request):
+    auth_otp.rate_limit_ip(request, "reset-verify", limit=20)
+    return auth_otp.verify_reset_code(body.identifier, body.code)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -167,6 +249,23 @@ def notifications(
     return get_notifications(admin.get("uid", "dev"), limit, unread_only)
 
 
+@app.post("/api/notifications/send", response_model=SendNotificationResponse, tags=["notifications"])
+def notifications_send(body: SendNotificationRequest, admin: dict = Depends(require_admin)):
+    """Admin -> one consumer (optionally linked to one of that consumer's cases)."""
+    return cases.send_admin_message(body.consumerId, body.title, body.message, body.caseId, admin.get("uid", "dev"))
+
+
+@app.get("/api/notifications/sent", response_model=SentNotificationsResponse, tags=["notifications"])
+def notifications_sent(
+    limit: int = Query(50, ge=1, le=200),
+    caseId: Optional[str] = Query(None),
+    consumerId: Optional[str] = Query(None),
+    _: dict = Depends(require_admin),
+):
+    """History of notifications sent to consumers (all, per case, or per consumer)."""
+    return {"items": cases.list_sent_notifications(limit, caseId, consumerId)}
+
+
 @app.post("/api/notifications/read", response_model=OkResponse, tags=["notifications"])
 def notifications_read(body: MarkReadRequest, admin: dict = Depends(require_admin)):
     """ids ko read mark karo, ya markAll=true se sab."""
@@ -178,14 +277,30 @@ def notifications_read(body: MarkReadRequest, admin: dict = Depends(require_admi
 # CASE MANAGEMENT  (Cases / Case Profile / Create Case / Escalate screens)
 # ─────────────────────────────────────────────────────────────
 async def _read_upload_files(files: List[UploadFile]) -> List[tuple]:
-    """UploadFile list ko (filename, bytes, content_type) tuples mai badalta hai."""
+    """UploadFile list -> (filename, bytes, content_type). Reads at most limit+1 bytes per
+    file so oversized uploads are rejected without loading them fully."""
+    s = get_settings()
+    real = [f for f in (files or []) if f and f.filename]
+    if len(real) > s.evidence_max_files:
+        raise HTTPException(status_code=400, detail=f"Too many files. Upload at most {s.evidence_max_files} at a time.")
+    cap = int(s.evidence_max_file_mb * 1024 * 1024)
     out = []
-    for f in files or []:
-        if not f or not f.filename:
-            continue
-        content = await f.read()
+    for f in real:
+        content = await f.read(cap + 1)
+        if len(content) > cap:
+            raise HTTPException(
+                status_code=413,
+                detail=f'"{f.filename}" is larger than the {s.evidence_max_file_mb:g} MB limit.',
+            )
         out.append((f.filename, content, f.content_type or "application/octet-stream"))
     return out
+
+
+def _disposition(value: str) -> str:
+    v = (value or "attachment").strip().lower()
+    if v not in ("attachment", "inline"):
+        raise HTTPException(status_code=422, detail="disposition must be attachment or inline")
+    return v
 
 
 @app.get("/api/cases", response_model=CasesListResponse, tags=["cases"])
@@ -195,13 +310,13 @@ def cases_list(
     _: dict = Depends(require_admin),
 ):
     """Case Management screen: status counts + (optionally filtered) list."""
-    return list_cases(status=status, search=search)
+    return cases.list_cases(status=status, search=search)
 
 
 @app.get("/api/cases/{case_id}", response_model=CaseDetail, tags=["cases"])
 def case_detail(case_id: str, _: dict = Depends(require_admin)):
     """Case Profile screen: poori detail — timeline, evidence, inspector."""
-    detail = get_case_detail(case_id)
+    detail = cases.get_case_detail(case_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Case not found")
     return detail
@@ -223,7 +338,7 @@ async def cases_create(
     """Create Case screen: naya case banata hai, evidence upload karta hai,
     AUR consumer ko notification + push bhejta hai — sab ek call mein."""
     file_tuples = await _read_upload_files(files)
-    return create_case(
+    return cases.create_case(
         consumer_id=consumerId,
         consumer_name=consumerName,
         area=area,
@@ -240,7 +355,7 @@ async def cases_create(
 @app.post("/api/cases/{case_id}/assign", response_model=CaseDetail, tags=["cases"])
 def cases_assign(case_id: str, body: AssignInspectorRequest, admin: dict = Depends(require_admin)):
     """Case Profile screen: inspector assign/change karta hai."""
-    detail = assign_inspector(case_id, body.inspector, admin.get("uid", "dev"))
+    detail = cases.assign_inspector(case_id, body.inspector, admin.get("uid", "dev"))
     if detail is None:
         raise HTTPException(status_code=404, detail="Case not found")
     return detail
@@ -249,7 +364,7 @@ def cases_assign(case_id: str, body: AssignInspectorRequest, admin: dict = Depen
 @app.post("/api/cases/{case_id}/close", response_model=CaseDetail, tags=["cases"])
 def cases_close(case_id: str, admin: dict = Depends(require_admin)):
     """Case Profile screen: 'Close Case' button — status Closed + consumer ko notify."""
-    detail = close_case(case_id, admin.get("uid", "dev"))
+    detail = cases.close_case(case_id, admin.get("uid", "dev"))
     if detail is None:
         raise HTTPException(status_code=404, detail="Case not found")
     return detail
@@ -267,7 +382,7 @@ async def cases_escalate(
     """Escalate Case screen: 'Confirm Escalation' — riskLevel/priority badhata hai,
     evidence attach karta hai, aur consumer ko notify karta hai."""
     file_tuples = await _read_upload_files(files)
-    detail = escalate_case(
+    detail = cases.escalate_case(
         case_id,
         escalation_level=escalationLevel,
         reason=reason,
@@ -280,27 +395,104 @@ async def cases_escalate(
     return detail
 
 
+@app.post("/api/cases/{case_id}/evidence", response_model=CaseDetail, tags=["cases"])
+async def cases_add_evidence(
+    case_id: str,
+    note: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+    admin: dict = Depends(require_admin),
+):
+    """Upload more evidence/documents to an existing case (S3) and notify the consumer."""
+    file_tuples = await _read_upload_files(files)
+    detail = cases.add_evidence(case_id, file_tuples, note, admin.get("uid", "dev"))
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return detail
+
+
+@app.get("/api/cases/{case_id}/evidence/{evidence_id}/url", response_model=DownloadUrlResponse, tags=["cases"])
+def cases_evidence_url(
+    case_id: str,
+    evidence_id: str,
+    disposition: str = Query("attachment", description="attachment | inline"),
+    _: dict = Depends(require_admin),
+):
+    """Short-lived presigned download URL for one evidence file."""
+    res = cases.get_admin_evidence_url(case_id, evidence_id, _disposition(disposition))
+    if res is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return res
+
+
+@app.post("/api/cases/{case_id}/status", response_model=CaseDetail, tags=["cases"])
+def cases_status(case_id: str, body: CaseStatusRequest, admin: dict = Depends(require_admin)):
+    """Change case status (Open | In Progress | Closed | Rejected). The consumer is notified."""
+    detail = cases.update_case_status(case_id, body.status, body.note, admin.get("uid", "dev"))
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return detail
+
+
+@app.post("/api/cases/{case_id}/remarks", response_model=CaseDetail, tags=["cases"])
+def cases_remark(case_id: str, body: CaseRemarkRequest, admin: dict = Depends(require_admin)):
+    """Admin remark / instruction on the case; sent to the consumer when notifyConsumer=true."""
+    detail = cases.add_case_remark(case_id, body.message, body.notifyConsumer, admin.get("uid", "dev"))
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return detail
+
+
 @app.get("/api/inspectors", response_model=InspectorsResponse, tags=["cases"])
 def inspectors_list(_: dict = Depends(require_admin)):
     """Assign Inspector modal ke liye live list."""
-    return {"items": list_inspectors()}
+    return {"items": cases.list_inspectors()}
 
 
 # ─────────────────────────────────────────────────────────────
 # CONSUMER-FACING  (apna consumer app — "me" endpoints)
 # ─────────────────────────────────────────────────────────────
 @app.get("/api/consumers/me/notifications", response_model=MyNotificationsResponse, tags=["consumer-self"])
-def my_notifications(user: dict = Depends(require_consumer)):
-    """Consumer NotificationsScreen: apni khud ki notifications (admin ne case
-    create/close/escalate karte waqt bheji hongi)."""
-    items = get_my_notifications(user.get("uid", ""), user.get("email", "") or "")
-    return {"items": items}
+def my_notifications(
+    limit: int = Query(100, ge=1, le=300),
+    user: dict = Depends(require_consumer),
+):
+    """Consumer NotificationsScreen: only this account's notifications."""
+    items = cases.get_my_notifications(user.get("uid", ""), user.get("email", "") or "", limit)
+    return {"items": items, "unreadCount": sum(1 for n in items if not n["read"])}
 
 
 @app.post("/api/consumers/me/notifications/mark-read", response_model=OkResponse, tags=["consumer-self"])
 def my_notifications_mark_read(body: MarkMyReadRequest, user: dict = Depends(require_consumer)):
-    mark_my_notifications_read(user.get("uid", ""), user.get("email", "") or "", body.ids)
+    cases.mark_my_notifications_read(user.get("uid", ""), user.get("email", "") or "", body.ids, body.markAll)
     return {"ok": True}
+
+
+@app.get("/api/consumers/me/cases", response_model=MyCasesResponse, tags=["consumer-self"])
+def my_cases(user: dict = Depends(require_consumer)):
+    return {"items": cases.list_my_cases(user.get("uid", ""), user.get("email", "") or "")}
+
+
+@app.get("/api/consumers/me/cases/{case_id}", response_model=MyCase, tags=["consumer-self"])
+def my_case(case_id: str, user: dict = Depends(require_consumer)):
+    """Case details for a notification: 404 unless the case belongs to this consumer."""
+    return cases.get_my_case(user.get("uid", ""), user.get("email", "") or "", case_id)
+
+
+@app.get(
+    "/api/consumers/me/cases/{case_id}/evidence/{evidence_id}/url",
+    response_model=DownloadUrlResponse,
+    tags=["consumer-self"],
+)
+def my_case_evidence_url(
+    case_id: str,
+    evidence_id: str,
+    disposition: str = Query("attachment", description="attachment | inline"),
+    user: dict = Depends(require_consumer),
+):
+    """Fresh presigned URL for one of this consumer's evidence files (call again when it expires)."""
+    return cases.get_my_evidence_url(
+        user.get("uid", ""), user.get("email", "") or "", case_id, evidence_id, _disposition(disposition)
+    )
 
 
 @app.get("/api/debug/consumptions", tags=["debug"])
