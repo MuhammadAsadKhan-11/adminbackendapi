@@ -121,6 +121,13 @@ class Settings(BaseSettings):
     auth_sessions_collection: str = "authSessions"
     otp_challenges_collection: str = "authOtpChallenges"
 
+    # Registration codes use their own EmailJS account (the one from the
+    # ElectraGuard app .env); login/2FA codes use the EMAILJS_* account above.
+    register_emailjs_service_id: Optional[str] = None
+    register_emailjs_public_key: Optional[str] = None
+    register_emailjs_private_key: Optional[str] = None
+    register_emailjs_template_id: Optional[str] = None
+
     def emailjs(self, name: str) -> str:
         """EmailJS value: EMAILJS_<NAME>, else EXPO_PUBLIC_EMAILJS_<NAME>."""
         return (getattr(self, f"emailjs_{name}") or getattr(self, f"expo_public_emailjs_{name}") or "").strip()

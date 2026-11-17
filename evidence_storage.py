@@ -194,6 +194,16 @@ def get_s3():
             }
             if (s.aws_s3_endpoint_url or "").strip():
                 kwargs["endpoint_url"] = s.aws_s3_endpoint_url.strip()
+            elif s.s3_region:
+                # Always use the regional host. Presigned links on the global
+                # s3.amazonaws.com host are rejected for non-us-east-1 buckets
+                # ("the region 'ap-southeast-2' is wrong; expecting 'us-east-1'").
+                kwargs["endpoint_url"] = f"https://s3.{s.s3_region}.amazonaws.com"
+                kwargs["config"] = Config(
+                    signature_version="s3v4",
+                    retries={"max_attempts": 3, "mode": "standard"},
+                    s3={"addressing_style": "virtual"},
+                )
             # Explicit keys only when provided; otherwise boto3's normal chain applies.
             if s.aws_access_key_id and s.aws_secret_access_key:
                 kwargs["aws_access_key_id"] = s.aws_access_key_id
