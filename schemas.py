@@ -454,3 +454,26 @@ class TwoFactorConfirmRequest(BaseModel):
 
 class TwoFactorConfirmResponse(BaseModel):
     enabled: bool
+
+
+# ── Registration (email code before the account is created) ──
+class RegistrationDetails(BaseModel):
+    fullName: str
+    consumerId: str
+    cnicNumber: str
+    email: str
+    mobileNumber: str
+
+
+class RegisterRequest(RegistrationDetails):
+    resend: bool = False
+
+
+class RegisterVerifyRequest(RegistrationDetails):
+    password: str
+    code: str
+
+
+class RegisterVerifyResponse(BaseModel):
+    created: bool
+    email: str

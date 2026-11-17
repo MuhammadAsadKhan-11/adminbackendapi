@@ -75,6 +75,9 @@ from schemas import (
     SendNotificationResponse,
     SentNotificationsResponse,
     SessionResponse,
+    RegisterRequest,
+    RegisterVerifyRequest,
+    RegisterVerifyResponse,
     TwoFactorChangeRequest,
     TwoFactorConfirmRequest,
     TwoFactorConfirmResponse,
@@ -215,6 +218,20 @@ def auth_2fa_request(body: TwoFactorChangeRequest, user: dict = Depends(require_
 @app.post("/api/auth/2fa/confirm", response_model=TwoFactorConfirmResponse, tags=["auth"])
 def auth_2fa_confirm(body: TwoFactorConfirmRequest, user: dict = Depends(require_signed_in)):
     return auth_otp.confirm_two_factor_change(user, body.enable, body.code, body.deviceId)
+
+
+@app.post("/api/auth/register/request", response_model=OtpRequestResponse, tags=["auth"])
+def auth_register_request(body: RegisterRequest, request: Request):
+    """New consumer: validate details and email a verification code (no account yet)."""
+    auth_otp.rate_limit_ip(request, "register", limit=10)
+    return auth_otp.request_registration_code(body.model_dump(exclude={"resend"}), body.resend)
+
+
+@app.post("/api/auth/register/verify", response_model=RegisterVerifyResponse, tags=["auth"])
+def auth_register_verify(body: RegisterVerifyRequest, request: Request):
+    """Code correct => create the Firebase account + consumer profile."""
+    auth_otp.rate_limit_ip(request, "register-verify", limit=20)
+    return auth_otp.complete_registration(body.model_dump(exclude={"password", "code"}), body.password, body.code)
 
 
 @app.post("/api/auth/password-reset/request", response_model=ResetCodeResponse, tags=["auth"])
@@ -491,6 +508,31 @@ def my_notifications_mark_read(body: MarkMyReadRequest, user: dict = Depends(req
 @app.get("/api/consumers/me/cases", response_model=MyCasesResponse, tags=["consumer-self"])
 def my_cases(user: dict = Depends(require_consumer)):
     return {"items": cases.list_my_cases(user.get("uid", ""), user.get("email", "") or "")}
+
+
+@app.post("/api/consumers/me/cases", response_model=MyCase, tags=["consumer-self"])
+async def my_case_create(
+    issueType: str = Form(...),
+    issueValue: str = Form(""),
+    description: str = Form(...),
+    location: str = Form(...),
+    urgency: str = Form("Low"),
+    files: List[UploadFile] = File(default=[]),
+    user: dict = Depends(require_consumer),
+):
+    """Report screen: consumer files a case; photos are stored in the evidence storage.
+    If a photo cannot be stored the case is not created."""
+    file_tuples = await _read_upload_files(files)
+    return cases.create_consumer_report(
+        user.get("uid", ""),
+        user.get("email", "") or "",
+        issue_label=issueType,
+        issue_value=issueValue,
+        description=description,
+        location=location,
+        urgency=urgency,
+        files=file_tuples,
+    )
 
 
 @app.get("/api/consumers/me/cases/{case_id}", response_model=MyCase, tags=["consumer-self"])

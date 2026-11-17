@@ -241,11 +241,11 @@ def token_auth_time(decoded: dict) -> int:
         return 0
 
 
-def two_factor_enabled(session: dict, admin: bool) -> bool:
-    """Per-account setting chosen in the Profile screen. Until the user changes it,
-    consumers start with 2FA OFF and admins with 2FA ON."""
+def two_factor_enabled(session: dict, admin: bool = False) -> bool:
+    """Per-account setting chosen in the Profile screen (Consumer and Admin work the
+    same way). Off until the account owner turns it on."""
     v = (session or {}).get("twoFactorEnabled")
-    return v if isinstance(v, bool) else admin
+    return v if isinstance(v, bool) else False
 
 
 def is_2fa_verified(uid: str, auth_time: int, admin: bool = False) -> bool:

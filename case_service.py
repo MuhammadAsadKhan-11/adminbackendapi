@@ -994,3 +994,100 @@ def mark_my_notifications_read(uid: str, email: str, ids: List[str], mark_all: b
             batch.update(sn.reference, {"read": True, "readAt": now})
         batch.commit()
     return len(targets)
+
+
+# ─────────────────────────────────────────────────────────────
+# CONSUMER: file a report (Report screen) — photo goes through the backend
+# to the same private evidence storage (S3) admins use. If the photo cannot
+# be stored, NO case is created, so a report is never "submitted" without it.
+# ─────────────────────────────────────────────────────────────
+REPORT_URGENCY = ("Low", "Medium", "High")
+
+
+def create_consumer_report(
+    uid: str,
+    email: str,
+    *,
+    issue_label: str,
+    issue_value: str,
+    description: str,
+    location: str,
+    urgency: str,
+    files: List[Tuple[str, bytes, str]],
+) -> Dict[str, Any]:
+    me = _me(uid, email)
+    if not me:
+        raise HTTPException(status_code=404, detail="Consumer profile not found.")
+    issue_label, description, location = (issue_label or "").strip(), (description or "").strip(), (location or "").strip()
+    if not issue_label:
+        raise HTTPException(status_code=400, detail="Please select an issue type.")
+    if not description:
+        raise HTTPException(status_code=400, detail="Please describe the issue.")
+    if not location:
+        raise HTTPException(status_code=400, detail="Please enter the meter location.")
+    if len(description) > 3000:
+        raise HTTPException(status_code=400, detail="Description is too long (3000 characters max).")
+    urgency = (urgency or "Low").strip().title()
+    if urgency not in REPORT_URGENCY:
+        raise HTTPException(status_code=400, detail="Urgency must be Low, Medium or High.")
+    if any(not (ct or "").startswith("image/") and not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".heic")) for name, _, ct in files):
+        raise HTTPException(status_code=400, detail="Only photos (JPG, PNG, WEBP, HEIC) can be attached to a report.")
+
+    db = get_db()
+    s = get_settings()
+    consumer_snap = db.collection(s.consumers_collection).document(me["docId"]).get()
+    cdata = consumer_snap.to_dict() or {}
+    name = str(first(cdata, "fullName", "name", default="Consumer"))
+
+    doc_ref = db.collection(s.cases_collection).document()
+    reference = f"RPT-{int(datetime.now(timezone.utc).timestamp() * 1000) % 1000000:06d}"
+    evidence = _upload_files(
+        files,
+        case_doc_id=doc_ref.id,
+        case_number=reference,
+        consumer_id=me["consumerId"],
+        consumer_uid=uid,
+        admin_uid="",
+    )
+    for e in evidence:
+        e.update({"uploadedBy": name, "uploadedByRole": "consumer", "uploadedByUid": uid, "adminId": None})
+
+    now, _, _ = _now_parts()
+    data = {
+        "caseId": reference,
+        "consumerId": me["consumerId"],
+        "consumerDocId": me["docId"],
+        "uid": uid,
+        "consumerName": name,
+        "consumerEmail": str(cdata.get("email") or email or ""),
+        "issueType": issue_label,
+        "issueValue": (issue_value or issue_label).strip(),
+        "category": issue_label,
+        "title": issue_label,
+        "description": description,
+        "location": location,
+        "area": location,
+        "riskLevel": urgency,
+        "priority": "High" if urgency == "High" else "Normal",
+        "currentStatus": "Under Investigation",
+        "status": "In Progress",
+        "assignedInspector": "",
+        "escalated": False,
+        "hasImage": False,  # legacy base64 flag; photos are in the evidence array
+        "evidence": evidence,
+        "resolution": "",
+        "timeline": [_timeline_entry("Report submitted by consumer")]
+        + ([_timeline_entry(f"{_file_word(len(evidence))} attached by consumer")] if evidence else []),
+        "createdAt": now,
+        "updatedAt": now,
+        "createdBy": uid,
+        "source": "consumer_report",
+    }
+    try:
+        doc_ref.set(data)
+    except Exception:
+        evidence_storage.delete_objects([e["s3Key"] for e in evidence])
+        raise
+    cache.invalidate()
+    log.info("Consumer report filed: %s (%d photos)", reference, len(evidence))
+    return _consumer_case_view(doc_ref.id, data)

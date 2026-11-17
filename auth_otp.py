@@ -42,6 +42,7 @@ PURPOSE_LABELS = {
     "password_reset": "Password reset",
     "2fa_on": "Turn on two-factor authentication",
     "2fa_off": "Turn off two-factor authentication",
+    "registration": "Verify your email to create your account",
 }
 _MAX_REMEMBERED_SIGNINS = 10
 
@@ -620,3 +621,93 @@ def confirm_two_factor_change(decoded: Dict[str, Any], enable: bool, code: str, 
     forget_2fa(uid)
     log.info("2FA turned %s for a %s account", target, role)
     return {"enabled": bool(enable)}
+
+
+# ─────────────────────────────────────────────────────────────
+# REGISTRATION: email code first, account created only after it is verified.
+# Same OTP machinery as login (hashed code, expiry, attempts, resend limits).
+# ─────────────────────────────────────────────────────────────
+import re as _re  # noqa: E402
+
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _registration_key(email: str) -> str:
+    return hashlib.sha256(email.strip().lower().encode()).hexdigest()[:32]
+
+
+def _validate_registration(d: Dict[str, Any]) -> Dict[str, str]:
+    clean = {k: str(d.get(k) or "").strip() for k in ("fullName", "consumerId", "cnicNumber", "email", "mobileNumber")}
+    clean["email"] = clean["email"].lower()
+    if not all(clean.values()):
+        raise HTTPException(status_code=400, detail="Please fill in all fields.")
+    if not _EMAIL_RE.match(clean["email"]):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    if not _re.fullmatch(r"[A-Za-z0-9]{1,12}", clean["consumerId"]):
+        raise HTTPException(status_code=400, detail="Consumer ID must be letters and numbers only (max 12).")
+    try:
+        fb_auth.get_user_by_email(clean["email"])
+        raise HTTPException(status_code=409, detail="This email is already registered. Please sign in instead.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # not found => OK
+    col = get_db().collection(get_settings().consumers_collection)
+    for value in dict.fromkeys([clean["consumerId"], clean["consumerId"].upper(), clean["consumerId"].lower()]):
+        if list(col.where("consumerId", "==", value).limit(1).stream()):
+            raise HTTPException(status_code=409, detail="This Consumer ID is already registered.")
+    return clean
+
+
+def _password_problem(pw: str) -> Optional[str]:
+    if len(pw) < 8 or len(pw) > 15:
+        return "Password must be 8-15 characters."
+    if not (_re.search(r"[a-z]", pw) and _re.search(r"[A-Z]", pw) and _re.search(r"[0-9]", pw) and _re.search(r"[^A-Za-z0-9]", pw)):
+        return "Password must include upper and lower case letters, a number and a special character."
+    return None
+
+
+def request_registration_code(details: Dict[str, Any], resend: bool) -> Dict[str, Any]:
+    clean = _validate_registration(details)
+    key = _registration_key(clean["email"])
+    return _issue_challenge(
+        f"register:{key}", uid=key, email=clean["email"], admin=False, purpose="registration", resend=resend
+    )
+
+
+def complete_registration(details: Dict[str, Any], password: str, code: str) -> Dict[str, Any]:
+    clean = _validate_registration(details)
+    problem = _password_problem(password or "")
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    _check_challenge(f"register:{_registration_key(clean['email'])}", code)  # one-time, expiring
+
+    try:
+        user = fb_auth.create_user(
+            email=clean["email"], password=password, display_name=clean["fullName"], email_verified=True
+        )
+    except fb_auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=409, detail="This email is already registered. Please sign in instead.")
+    except Exception as exc:
+        log.error("Registration: create_user failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail="Could not create the account. Check the email and password.")
+    try:
+        get_db().collection(get_settings().consumers_collection).document(user.uid).set(
+            {
+                "uid": user.uid,
+                "fullName": clean["fullName"],
+                "consumerId": clean["consumerId"],
+                "cnicNumber": clean["cnicNumber"],
+                "email": clean["email"],
+                "mobileNumber": clean["mobileNumber"],
+                "role": "consumer",
+                "isVerified": True,
+                "lastVerifiedAt": int(time.time() * 1000),
+                "createdAt": fb_firestore.SERVER_TIMESTAMP,
+            }
+        )
+    except Exception:
+        fb_auth.delete_user(user.uid)  # no half-created accounts
+        raise HTTPException(status_code=503, detail="Could not save your account. Please try again.")
+    log.info("Consumer account registered (email verified)")
+    return {"created": True, "email": clean["email"]}
