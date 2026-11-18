@@ -389,6 +389,8 @@ class RiskDistribution(BaseModel):
     low: int
     medium: int
     high: int
+    total: int = 0             # low + medium + high (records with a valid risk band)
+    unclassified: int = 0      # records without a usable risk level/score (not counted as low)
 
 
 class AreaCases(BaseModel):
@@ -408,6 +410,13 @@ class InsightItem(BaseModel):
     subtitle: str
 
 
+class TrendPoint(BaseModel):
+    date: str
+    label: str
+    normal: float       # kWh from consumers the model found normal
+    theft: float        # kWh from consumers flagged for suspected theft
+
+
 class ReportsSummaryResponse(BaseModel):
     period: str                      # 7d | 30d | 3m
     periodLabel: str
@@ -416,6 +425,7 @@ class ReportsSummaryResponse(BaseModel):
     stats: ReportStats
     riskDistribution: RiskDistribution
     areaTheft: List[AreaCases]
+    consumptionTrend: List["TrendPoint"] = []
     revenueLossByArea: List[AreaLoss]
     insights: List[InsightItem]
     generatedAt: str

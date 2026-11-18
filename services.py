@@ -369,6 +369,9 @@ def normalize_upload(doc_id: str, d: Dict[str, Any]) -> Dict[str, Any]:
         "prediction": prediction,
         "isTheft": is_theft_prediction(first(d, "prediction", "result", "label")),
         "riskScore": normalize_score(d.get("riskScore")),
+        # raw values for the Reports risk breakdown (no silent "low" for missing data)
+        "riskLevelRaw": str(d.get("riskLevel") or "").strip(),
+        "hasRiskScore": d.get("riskScore") is not None and str(d.get("riskScore")).strip() != "",
         "totalUnits": total,
         "avgUnits": num(first(d, "avgUnits", "avg_units")),
         "estimatedBill": num(d.get("estimatedBill")),

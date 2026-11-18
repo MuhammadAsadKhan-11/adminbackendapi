@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -108,14 +109,56 @@ def _upload_loss_pkr(u: Dict[str, Any]) -> float:
     return loss_kwh * tariff
 
 
+UNSPECIFIED_AREA = "Unspecified"
+_CITY_WORDS = {"islamabad", "rawalpindi", "lahore", "karachi", "peshawar", "pakistan", "isb", "pk"}
+_SECTOR_RE = re.compile(r"^([A-Za-z])\s*-?\s*(\d{1,2})(\s*/\s*\d)?$")
+
+
+def normalize_area(raw: Any) -> str:
+    """One label per area: trims/case-folds, drops a trailing city name and writes
+    sectors one way ("i8", "I 8", "I-8 Islamabad" -> "I-8")."""
+    text = re.sub(r"[\s,]+", " ", str(raw or "")).strip()
+    if not text:
+        return UNSPECIFIED_AREA
+    words = text.split(" ")
+    if len(words) > 1:
+        kept = [w for w in words if w.lower() not in _CITY_WORDS]
+        words = kept or words
+    text = " ".join(words)
+    m = _SECTOR_RE.match(text)
+    if m:
+        return f"{m.group(1).upper()}-{m.group(2)}{(m.group(3) or '').replace(' ', '')}"
+    return text.title() if text.islower() or text.isupper() else text
+
+
 def _case_area(c: Dict[str, Any], by_key: Dict[str, Dict[str, Any]]) -> str:
     if c["location"]:
-        return c["location"]
+        return normalize_area(c["location"])
     for k in c["keys"]:
         e = by_key.get(k)
         if e and e.get("location"):
-            return e["location"]
-    return "Unknown"
+            return normalize_area(e["location"])
+    return UNSPECIFIED_AREA
+
+
+_LEVELS = ("low", "medium", "high")
+
+
+def record_risk_level(u: Dict[str, Any]) -> Optional[str]:
+    """Risk band of ONE detection record: the ML model's own riskLevel when stored,
+    else the configured score thresholds. Missing/invalid data -> None (never 'low')."""
+    lvl = str(u.get("riskLevelRaw") or "").strip().lower()
+    if lvl in _LEVELS:
+        return lvl
+    if u.get("hasRiskScore"):
+        s = get_settings()
+        score = u["riskScore"]
+        if score >= s.high_risk_threshold:
+            return "high"
+        if score >= s.medium_risk_threshold:
+            return "medium"
+        return "low"
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -143,8 +186,21 @@ def _window_numbers(start: date, end: date) -> Dict[str, Any]:
             hours.append((done - c["createdAt"]).total_seconds() / 3600.0)
     avg_hours = sum(hours) / len(hours) if hours else 0.0
 
+    # Risk distribution = every detection record (consumption upload) in the
+    # window, each document counted once. Unclassifiable records are reported
+    # separately instead of being counted as Low.
+    risk = {"low": 0, "medium": 0, "high": 0, "unclassified": 0}
+    seen_ids = set()
+    for e in entities:
+        for u in e["uploads"]:
+            d = _upload_day(u)
+            if d is None or not (start <= d <= end) or u["id"] in seen_ids:
+                continue
+            seen_ids.add(u["id"])
+            risk[record_risk_level(u) or "unclassified"] += 1
+    risk["total"] = risk["low"] + risk["medium"] + risk["high"]
+
     # har entity ki window ki latest upload
-    risk = {"low": 0, "medium": 0, "high": 0}
     loss_total = 0.0
     loss_by_area: Dict[str, float] = defaultdict(float)
     loss_consumers = 0
@@ -158,11 +214,10 @@ def _window_numbers(start: date, end: date) -> Dict[str, Any]:
         if latest is None:
             continue
         level = svc.compute_level(latest["riskScore"], latest["isTheft"])
-        risk[level.lower()] += 1
         if latest["isTheft"]:
             loss = _upload_loss_pkr(latest)
             loss_total += loss
-            loss_by_area[(e.get("location") or "").strip() or "Unknown"] += loss
+            loss_by_area[normalize_area(e.get("location"))] += loss
             loss_consumers += 1
         if latest["isTheft"] or level == "High":
             flagged.append(e)
@@ -216,6 +271,14 @@ def build_reports_summary(period: str) -> Dict[str, Any]:
         {"area": a, "cases": c}
         for a, c in sorted(cur["area_cases"].items(), key=lambda kv: kv[1], reverse=True)[:MAX_AREAS]
     ]
+    # Theft vs normal consumption per day of the window (same daily series as the dashboard chart)
+    daily = svc._model()["daily"]
+    consumption_trend = []
+    for i in range((end - start).days + 1):
+        d = start + timedelta(days=i)
+        v = daily.get(d, {"normal": 0.0, "theft": 0.0})
+        consumption_trend.append({"date": d.isoformat(), "label": svc.fmt_label(d), "normal": round(v["normal"], 1), "theft": round(v["theft"], 1)})
+
     area_loss = [
         {"area": a, "amount": round(v, 0)}
         for a, v in sorted(cur["loss_by_area"].items(), key=lambda kv: kv[1], reverse=True)[:MAX_AREAS]
@@ -287,6 +350,7 @@ def build_reports_summary(period: str) -> Dict[str, Any]:
         "stats": stats,
         "riskDistribution": cur["risk"],
         "areaTheft": area_theft,
+        "consumptionTrend": consumption_trend,
         "revenueLossByArea": area_loss,
         "insights": insights,
         "generatedAt": _iso(datetime.now(timezone.utc)),
