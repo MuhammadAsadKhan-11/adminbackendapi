@@ -592,7 +592,7 @@ def reports_summary(
 @app.get("/api/reports/export", tags=["reports"])
 def reports_export(
     period: str = Query("7d", description="7d | 30d | 3m"),
-    format: str = Query("csv", description="abhi sirf csv"),
+    format: str = Query("csv", description="only csv is supported"),
     _: dict = Depends(require_admin),
 ):
     """Export button: report ko CSV ke taur par download/share karne ke liye."""

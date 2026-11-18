@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
 from functools import lru_cache
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -21,8 +22,14 @@ log = logging.getLogger("electraguard")
 # ─────────────────────────────────────────────────────────────
 # SETTINGS  (.env file ya environment variables se aati hain)
 # ─────────────────────────────────────────────────────────────
+_APP_ENV_FILE = Path(__file__).resolve().parent.parent / "ElectraGuard" / ".env"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # .env of this backend + (locally) the ElectraGuard app's .env, whose
+    # EXPO_PUBLIC_EMAILJS_* keys are the account for registration / login /
+    # forgot-password codes. Later files win; a missing file is ignored.
+    model_config = SettingsConfigDict(env_file=(str(_APP_ENV_FILE), ".env"), extra="ignore")
 
     firebase_credentials_path: Optional[str] = None
     firebase_credentials_json: Optional[str] = None
@@ -121,16 +128,18 @@ class Settings(BaseSettings):
     auth_sessions_collection: str = "authSessions"
     otp_challenges_collection: str = "authOtpChallenges"
 
-    # Registration codes use their own EmailJS account (the one from the
-    # ElectraGuard app .env); login/2FA codes use the EMAILJS_* account above.
-    register_emailjs_service_id: Optional[str] = None
-    register_emailjs_public_key: Optional[str] = None
-    register_emailjs_private_key: Optional[str] = None
-    register_emailjs_template_id: Optional[str] = None
-
+    # Two EmailJS accounts:
+    #   EXPO_PUBLIC_EMAILJS_*  (ElectraGuard app .env; on Render set the same names)
+    #       -> registration, login OTP and forgot-password codes
+    #   EMAILJS_*              (this backend's .env)
+    #       -> turning 2FA on/off from the Consumer and Admin Profile screens
     def emailjs(self, name: str) -> str:
-        """EmailJS value: EMAILJS_<NAME>, else EXPO_PUBLIC_EMAILJS_<NAME>."""
-        return (getattr(self, f"emailjs_{name}") or getattr(self, f"expo_public_emailjs_{name}") or "").strip()
+        """Profile 2FA account (EMAILJS_<NAME>)."""
+        return (getattr(self, f"emailjs_{name}") or "").strip()
+
+    def app_emailjs(self, name: str) -> str:
+        """Registration / login / password-reset account (EXPO_PUBLIC_EMAILJS_<NAME>)."""
+        return (getattr(self, f"expo_public_emailjs_{name}") or "").strip()
 
     @property
     def s3_region(self) -> Optional[str]:

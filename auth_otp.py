@@ -117,27 +117,30 @@ def emailjs_config_status() -> Dict[str, bool]:
         name: bool(s.emailjs(name))
         for name in ("service_id", "public_key", "private_key", "consumer_template_id", "admin_template_id")
     }
-    out["registration_account"] = all(_emailjs_account(False, "registration"))
+    out = {f"profile_2fa_{k}": v for k, v in out.items()}
+    out.update({f"app_{name}": bool(s.app_emailjs(name)) for name in ("service_id", "public_key", "private_key", "consumer_template_id", "admin_template_id")})
+    out["app_account_ready"] = all(_emailjs_account(False, "registration")) and all(_emailjs_account(True, "login"))
+    out["profile_2fa_account_ready"] = all(_emailjs_account(False, "2fa_on")) and all(_emailjs_account(True, "2fa_on"))
     return out
 
 
+PROFILE_2FA_PURPOSES = ("2fa_on", "2fa_off")
+
+
 def _emailjs_account(admin: bool, purpose: str) -> Tuple[str, str, str, str]:
-    """(service, public key, private key, template) for this kind of email."""
+    """(service, public key, private key, template) for this kind of email.
+
+    Profile 2FA on/off codes  -> backend EMAILJS_* account.
+    Everything else (registration, login OTP, forgot password)
+                              -> the ElectraGuard app's EXPO_PUBLIC_EMAILJS_* account.
+    Admin emails use the admin template, consumer emails the consumer template."""
     s = get_settings()
-    if purpose == "registration":
-        # New-account codes: the ElectraGuard app's EmailJS account (REGISTER_EMAILJS_*).
-        return (
-            (s.register_emailjs_service_id or "").strip(),
-            (s.register_emailjs_public_key or "").strip(),
-            (s.register_emailjs_private_key or "").strip(),
-            (s.register_emailjs_template_id or "").strip(),
-        )
-    return (
-        s.emailjs("service_id"),
-        s.emailjs("public_key"),
-        s.emailjs("private_key"),
-        s.emailjs("admin_template_id" if admin else "consumer_template_id"),
-    )
+    template = "admin_template_id" if admin else "consumer_template_id"
+    if purpose in PROFILE_2FA_PURPOSES:
+        get = s.emailjs
+    else:
+        get = s.app_emailjs
+    return get("service_id"), get("public_key"), get("private_key"), get(template)
 
 
 def send_otp_email(to_email: str, code: str, *, admin: bool, purpose: str) -> None:
